@@ -17,10 +17,10 @@ pub fn build_cli() -> Command {
                 .help("Log updated packages to a file"),
         )
         .arg(
-            Arg::new("FILE")
-                .short('f')
+            Arg::new("TOML")
+                .short('t')
                 .num_args(1)
-                .help("Path to a list of packages to be updated"),
+                .help("Path to toml for supplying updates info"),
         )
         .arg(
             Arg::new("INCLUDE")

@@ -42,7 +42,6 @@ struct CheckResultOutput {
     name: String,
     before: String,
     after: String,
-    path: String,
     warnings: Vec<String>,
 }
 
@@ -52,7 +51,8 @@ fn collect_spec(dir: &Path) -> Result<Vec<PathBuf>> {
         .into_iter()
         .filter_map(|x| {
             let entry = x.ok()?;
-            if entry.file_name() == "spec" {
+            let name = entry.file_name().to_string_lossy();
+            if name == "spec" || name.ends_with(".spec") {
                 entry.path().canonicalize().ok()
             } else {
                 None
@@ -63,40 +63,31 @@ fn collect_spec(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(result)
 }
 
-fn normalize_name(path: &Path) -> Cow<str> {
+fn read_toml_config(path: &Path) -> Result<HashMap<String, String>> {
+    let content = std::fs::read_to_string(path)?;
+    let map: HashMap<String, String> = toml::from_str(&content)?;
+    Ok(map)
+}
+
+fn normalize_name(path: &Path) -> Cow<'_, str> {
     let p = path.parent().unwrap_or(path);
     let p = p.file_name().unwrap_or(p.as_os_str());
 
     p.to_string_lossy()
 }
 
-fn normalize_filename(path: &Path) -> Cow<str> {
-    let p = path.file_name().unwrap_or(path.as_os_str());
 
-    p.to_string_lossy()
-}
-
-fn update_version<P: AsRef<Path>>(
-    new: &str,
-    spec: P,
-    replace_upstream_ver: bool,
-) -> Result<String> {
+fn update_version<P: AsRef<Path>>(new: &str, spec: P) -> Result<String> {
     let mut f = OpenOptions::new()
         .read(true)
         .write(true)
         .open(spec.as_ref())?;
     let mut content = String::new();
     f.read_to_string(&mut content)?;
-    let replace_rel = Regex::new("REL=.+\\s+").unwrap();
-
-    let replaced = if replace_upstream_ver {
-        let replace = Regex::new("UPSTREAM_VER=.+").unwrap();
-        replace.replace(&content, format!("UPSTREAM_VER={}", new))
-    } else {
-        let replace = Regex::new("VER=.+").unwrap();
-        replace.replace(&content, format!("VER={}", new))
-    };
-    let replaced = replace_rel.replace(&replaced, "");
+    let re = Regex::new(r"(?m)^Version:(\s*).+$").unwrap();
+    let replaced = re.replace(&content, |caps: &regex::Captures| {
+        format!("Version:{}{}", &caps[1], new)
+    });
 
     f.seek(SeekFrom::Start(0))?;
     let bytes = replaced.as_bytes();
@@ -106,56 +97,33 @@ fn update_version<P: AsRef<Path>>(
     Ok(replaced.to_string())
 }
 
-fn validate_urls(a: &HashMap<String, String>, b: &HashMap<String, String>) -> bool {
-    for (key, value) in a.iter() {
-        if !key.starts_with("SRCS") {
-            continue;
-        }
-        if let Some(other) = b.get(key) {
-            let a_split = value.split_ascii_whitespace();
-            let b_split = other.split_ascii_whitespace();
-            for (old, new) in a_split.zip(b_split) {
-                if old == new {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
-}
 
 fn check_update_worker<P: AsRef<Path>>(
     client: &Client,
     spec: P,
     dry_run: bool,
-    mut comply: bool,
+    comply: bool,
+    toml_override: Option<&str>,
 ) -> Result<CheckerResult> {
     let s = parser::parse_spec(spec.as_ref())?;
-    let mut is_upstream_ver = false;
-    let current_version = if let Some(v) = s.get("UPSTREAM_VER") {
-        comply = false;
-        is_upstream_ver = true;
-        v
-    } else {
-        s.get("VER").ok_or_else(|| {
-            anyhow!(
-                "{}: 'UPSTREAM_VER' and 'VER' field is missing!",
-                spec.as_ref().display()
-            )
-        })?
-    };
-
-    let current_version = current_version.trim();
-    let config_line = s.get("CHKUPDATE").ok_or_else(|| {
+    let current_version = s.get("VER").ok_or_else(|| {
         anyhow!(
-            "{}: 'CHKUPDATE' field is missing, cannot continue!",
+            "{}: 'Version' field is missing!",
             spec.as_ref().display()
         )
     })?;
+
+    let current_version = current_version.trim();
     let mut warnings = Vec::new();
-    let config_line = config_line.to_owned() + ";"; // compensate for the parser quirk
-    let config = parser::parse_check_update(&mut config_line.as_str())?;
+    let config = if let Some(raw) = toml_override {
+        let raw = format!("{};", raw);
+        parser::parse_check_update(&mut raw.as_str())?
+    } else {
+        return Err(anyhow!(
+            "{}: no CHKUPDATE config available (TOML not provided)",
+            spec.as_ref().display()
+        ));
+    };
     let new_version = checker::check_update(&config, client)?;
     let new_version = new_version.trim();
     let new_version = new_version.strip_prefix('v').unwrap_or(new_version);
@@ -183,7 +151,7 @@ fn check_update_worker<P: AsRef<Path>>(
         });
     }
     let snapshot_version = AhoCorasickBuilder::new().build(VCS_VERSION_NUMBERS);
-    if current_version.contains('+') && !comply && !is_upstream_ver {
+    if current_version.contains('+') && !comply {
         warnings.push(format!("Compound version number '{}'", current_version));
         if let Some(version) = snapshot_version?.find(current_version) {
             warnings.push(format!(
@@ -207,20 +175,7 @@ fn check_update_worker<P: AsRef<Path>>(
     }
 
     if !dry_run {
-        let modified = update_version(new_version, spec.as_ref(), is_upstream_ver)?;
-        let mut new_ctx = HashMap::new();
-        match abbs_meta_apml::parse(&modified, &mut new_ctx) {
-            Ok(_) => {
-                if validate_urls(&s, &new_ctx) {
-                    warnings.push("Hardcoded URLs detected.".to_string());
-                }
-            }
-            Err(err) => {
-                for i in err {
-                    warnings.push(format!("Modified spec is broken: {i}"));
-                }
-            }
-        }
+        update_version(new_version, spec.as_ref())?;
     }
 
     Ok(CheckerResult {
@@ -272,23 +227,25 @@ fn main() {
     let version_only = args.get_flag("VERSION_ONLY");
     let update_checksum = args.get_flag("UPDATE_CHECKSUM");
     let current_path = std::env::current_dir().expect("Failed to get current dir.");
-    let workdir = if let Some(d) = args.get_one::<String>("DIR") {
-        Path::new(d).canonicalize().unwrap()
+    let workdir = args
+        .get_one::<String>("DIR")
+        .map(|d| {
+            let path = Path::new(d).canonicalize().unwrap();
+            let specs = path.join("SPECS");
+            if specs.is_dir() { specs } else { path }
+        })
+        .unwrap_or_else(|| Path::new(".").canonicalize().unwrap());
+
+    let toml_config = if let Some(toml_path) = args.get_one::<String>("TOML") {
+        let path = Path::new(toml_path);
+        let map = read_toml_config(path).expect("Failed to read TOML file");
+        Some(map)
     } else {
-        Path::new(".").canonicalize().unwrap()
+        None
     };
 
-    let mut files = if let Some(list) = args.get_one::<String>("FILE") {
-        let path = Path::new(list).canonicalize().unwrap();
-        std::env::set_current_dir(workdir).expect("Failed to set current directory");
-        let list = parser::expand_package_list([&path]);
-        list.into_iter()
-            .map(|x| Path::new(&x).join("spec"))
-            .collect()
-    } else {
-        std::env::set_current_dir(workdir).expect("Failed to set current directory");
-        collect_spec(Path::new(".")).unwrap()
-    };
+    std::env::set_current_dir(workdir).expect("Failed to set current directory");
+    let mut files = collect_spec(Path::new(".")).unwrap();
 
     if let Some(pattern) = pattern {
         files.retain(|x| {
@@ -297,6 +254,13 @@ fn main() {
             } else {
                 false
             }
+        });
+    }
+
+    if let Some(ref config) = toml_config {
+        files.retain(|x| {
+            let name = normalize_name(x);
+            config.get(name.as_ref()).map_or(false, |v| !v.is_empty())
         });
     }
 
@@ -313,7 +277,11 @@ fn main() {
             let name = normalize_name(f);
             let current = current.fetch_add(1, Ordering::SeqCst);
             info!("[{}/{}] Checking {} ...", current, total, &name);
-            check_update_worker(c, f, dry_run, comply_with_aosc)
+            let toml_override = toml_config
+                .as_ref()
+                .and_then(|cfg| cfg.get(name.as_ref()))
+                .map(|s| s.as_str());
+            check_update_worker(c, f, dry_run, comply_with_aosc, toml_override)
                 .map_err(|e| anyhow!("{}: {:?}", name.cyan(), e))
         })
         .collect();
@@ -350,9 +318,7 @@ fn main() {
     let log = args.get_one::<String>("LOG");
     let json = args.get_one::<String>("JSON");
     if log.is_some() || json.is_some() {
-        let tree = get_tree(Path::new(".")).expect("Failed to get tree path.");
-
-        let items = results
+        let items: Vec<_> = results
             .par_iter()
             .filter_map(|x| {
                 if let Ok(ret) = x {
@@ -364,14 +330,13 @@ fn main() {
                         name: ret.name.to_owned(),
                         before: ret.before.to_owned(),
                         after: ret.after.to_owned(),
-                        path: find_path(&ret.name, &tree),
                         warnings: ret.warnings.to_vec(),
                     })
                 } else {
                     None
                 }
             })
-            .collect::<Vec<_>>();
+            .collect();
 
         if let Some(log) = log {
             let log = Path::new(log);
@@ -383,7 +348,7 @@ fn main() {
 
             let mut f = File::create(&*log).unwrap();
             for i in &items {
-                writeln!(f, "{}", find_path(&i.name, &tree)).unwrap();
+                writeln!(f, "{}", i.name).unwrap();
             }
 
             info!("Wrote results to {}", log.display());
@@ -402,47 +367,4 @@ fn main() {
             info!("Wrote results to {}", json.display());
         }
     }
-}
-
-fn get_tree(directory: &Path) -> Result<PathBuf> {
-    let mut tree = directory.canonicalize()?;
-    let mut has_groups;
-    loop {
-        has_groups = tree.join("groups").is_dir();
-        if !has_groups && tree.to_str() == Some("/") {
-            return Err(anyhow!("Cannot find ABBS tree!"));
-        }
-        if has_groups {
-            return Ok(tree.to_path_buf());
-        }
-        tree.pop();
-    }
-}
-
-fn find_path(pkg: &str, tree: &Path) -> String {
-    let path = find_path_inner(pkg, tree).expect(&format!("Failed to find path: {}", pkg));
-
-    let path = path
-        .strip_prefix(&tree)
-        .expect(&format!("Failed to strip prefix path: {}", tree.display()));
-
-    path.display().to_string()
-}
-
-fn find_path_inner(name: &str, tree: &Path) -> Result<PathBuf> {
-    let packages = WalkDir::new(tree).min_depth(2).max_depth(2);
-    let mut path = None;
-
-    for entry in packages {
-        let entry = entry?;
-        let p = entry.into_path().canonicalize()?;
-        let file_name = normalize_filename(&p);
-
-        if file_name == name {
-            path = Some(p);
-            break;
-        }
-    }
-
-    path.ok_or_else(|| anyhow!("Failed to get package path: {}", name))
 }
